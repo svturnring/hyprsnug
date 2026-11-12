@@ -1,0 +1,8 @@
+# Build artifacts
+hyprsnug.so
+build/
+*.o
+
+# Local-only project docs
+AGENTS.md
+BUSINESS.md

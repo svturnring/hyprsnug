@@ -1,0 +1,19 @@
+# hyprpm manifest — lets `hyprpm add` build, manage, and load the plugin
+# (see "Install via hyprpm" in README.md and the hyprpm docs).
+#
+# Keep in sync with the build files:
+#   - `build` must be able to produce `output` in a fresh clone of this
+#     repository (the Makefile writes ./hyprsnug.so at the root);
+#   - no version is declared here on purpose. hyprpm ignores `version` for
+#     hyprpm manifests, and the plugin version has a single source of truth:
+#     the VERSION file (see "Versioning" in AGENTS.md).
+
+[repository]
+name = "hyprsnug"
+authors = ["svtrn"]
+
+[hyprsnug]
+description = "Inherits scrolling column widths from window widths on embed, drag, open into the strip and workspace move"
+authors = ["svtrn"]
+output = "hyprsnug.so"
+build = ["make all"]
