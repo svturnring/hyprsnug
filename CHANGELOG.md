@@ -8,3 +8,15 @@ and this project adheres to
 version lives in [`VERSION`](./VERSION).
 
 ## [Unreleased]
+
+### Added
+
+- `make dev-reload` / `make dev-done`: the smoke-test loop that unloads the
+  plugin, rebuilds it, and hot-loads it back into the running Hyprland, then
+  returns to the hyprpm-managed install.
+
+### Changed
+
+- `README.md` rewritten around the product itself: what the plugin changes about
+  the scrolling layout, why a window should keep its size across modes, and how
+  to install and configure it. Implementation notes and keybinds are gone.
