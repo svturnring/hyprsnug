@@ -4,6 +4,12 @@ A window-first overhaul of Hyprland's built-in **scrolling** layout. It turns th
 strip into a sequence of applications that keep their own size, instead of a set
 of columns that every application has to fit into.
 
+## Demo
+
+https://github.com/user-attachments/assets/088b2c83-0f0f-4a2e-9733-1abeb41c7115
+
+[Vimeo](https://vimeo.com/1246319728)
+
 ## Why
 
 Hyprland keeps several independent sizes for one and the same window: the
