@@ -39,7 +39,9 @@ at their own sizes.
 
 The width of a column follows the width of the window inside it. When a window
 enters the strip — by being opened into it, embedded from floating, or moved —
-the column is sized from that window instead of the default column width. Each
+the column is sized from that window instead of the default column width. The
+same holds when a window is moved out of a stacked column into a column of its
+own, by `promote` or by a directional move at the edge of the strip. Each
 application keeps its size without affecting its neighbors, so scrolling through
 many open windows leaves every one of them as it was.
 

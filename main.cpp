@@ -360,6 +360,89 @@ void fitColumnToWindow(const PHLWINDOW& w, std::optional<float> widthPx = std::n
     }
 }
 
+/*
+    Fitting the fresh columns Hyprland creates through its own reorganization
+    paths, which no plugin-visible event reports (BR-24):
+
+      * the promote / expel / consume_or_expel layout messages create the fresh
+        column inside CScrollingAlgorithm::expelTarget;
+      * a directional move (the `move` dispatcher) of a stacked window at the
+        edge of the strip creates one inline in CScrollingAlgorithm::moveTargetTo.
+
+    Both size the new column at the layout's default width. Both functions are
+    hooked and the fresh column is fitted right after the original runs, through
+    the same fitColumnToWindow the embed / drag / open paths use. The hooked
+    addresses come from member pointers spelled out against the header, so a
+    Hyprland signature change fails the build instead of hooking garbage.
+    fitColumnToWindow ignores columns with more than one member, so moves that
+    join an adjacent column -- and explicit widths the user has set on an
+    existing column -- are never overwritten. Neither function is reachable
+    from fitColumnToWindow, so the hook cannot recurse.
+*/
+using expelTarget_t  = void (*)(void*, SP<Layout::Tiled::SScrollingTargetData>, SP<Layout::Tiled::SColumnData>, std::optional<int64_t>);
+using moveTargetTo_t = void (*)(void*, SP<Layout::ITarget>, Math::eDirection, bool);
+
+expelTarget_t  g_origExpelTarget  = nullptr;
+moveTargetTo_t g_origMoveTargetTo = nullptr;
+CFunctionHook* g_hookExpelTarget  = nullptr;
+CFunctionHook* g_hookMoveTargetTo = nullptr;
+
+void hkExpelTarget(void* self, SP<Layout::Tiled::SScrollingTargetData> tdata, SP<Layout::Tiled::SColumnData> srcCol, std::optional<int64_t> insertIdx) {
+    g_origExpelTarget(self, tdata, srcCol, insertIdx);
+    safeRun("expelTarget fit", [&] {
+        const auto TARGET = tdata ? tdata->target.lock() : nullptr;
+        if (const auto W = TARGET ? TARGET->window() : nullptr)
+            fitColumnToWindow(W);
+    });
+}
+
+void hkMoveTargetTo(void* self, SP<Layout::ITarget> t, Math::eDirection dir, bool silent) {
+    // The column the window starts in: fitted only when the move expels the
+    // window into a fresh column of its own. A no-op move or an in-column
+    // reorder keeps the column; a move into an adjacent column joins its
+    // members -- both are skipped.
+    WP<Layout::Tiled::SColumnData> colBefore;
+    safeRun("moveTargetTo pre", [&] {
+        auto* const SCROLLING = static_cast<Layout::Tiled::CScrollingAlgorithm*>(self);
+        if (!SCROLLING || !t)
+            return;
+        if (const auto DATA = SCROLLING->dataFor(t))
+            colBefore = DATA->column;
+    });
+
+    g_origMoveTargetTo(self, t, dir, silent);
+
+    safeRun("moveTargetTo fit", [&] {
+        if (!t)
+            return;
+
+        auto* const SCROLLING = static_cast<Layout::Tiled::CScrollingAlgorithm*>(self);
+        if (!SCROLLING)
+            return;
+
+        const auto W = t->window();
+        if (!W)
+            return;
+
+        const auto DATA = SCROLLING->dataFor(t);
+        const auto COL  = DATA ? DATA->column.lock() : nullptr;
+
+        if (!COL) {
+            // The window left this algorithm entirely (directional move onto a
+            // neighboring monitor, binds:window_direction_monitor_fallback):
+            // fit it in whatever column it landed in now.
+            if (colBefore.lock())
+                fitColumnToWindow(W);
+            return;
+        }
+
+        if (COL == colBefore.lock() || COL->targetDatas.size() != 1)
+            return; // no-op or reorder within the column, or joined an existing column
+
+        fitColumnToWindow(W);
+    });
+}
+
 } // namespace
 
 // Do NOT change this function.
@@ -399,6 +482,32 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // Force-construct the config value accessors now, while every value above
     // is definitely registered, so no event handler ever has to bind them.
     (void)pluginConfig();
+
+    // Hook the two scrolling paths that create a fresh column outside any event
+    // the plugin can listen to (see hkExpelTarget / hkMoveTargetTo). If a hook
+    // cannot be installed the plugin degrades to its event-driven fits only;
+    // the drag-end split's direct expelTarget call does not depend on them.
+    union {
+        void (Layout::Tiled::CScrollingAlgorithm::*m)(SP<Layout::Tiled::SScrollingTargetData>, SP<Layout::Tiled::SColumnData>, std::optional<int64_t>);
+        void* p;
+    } expelAddr{&Layout::Tiled::CScrollingAlgorithm::expelTarget};
+    union {
+        void (Layout::Tiled::CScrollingAlgorithm::*m)(SP<Layout::ITarget>, Math::eDirection, bool);
+        void* p;
+    } moveAddr{&Layout::Tiled::CScrollingAlgorithm::moveTargetTo};
+
+    g_hookExpelTarget = HyprlandAPI::createFunctionHook(PHANDLE, expelAddr.p, reinterpret_cast<void*>(&hkExpelTarget));
+    if (g_hookExpelTarget && g_hookExpelTarget->hook()) {
+        g_origExpelTarget = reinterpret_cast<expelTarget_t>(g_hookExpelTarget->m_original);
+    } else
+        Log::logger->log(Hyprutils::CLI::LOG_ERR, "[hyprsnug] expelTarget hook failed: promote/expel columns keep the layout default width");
+
+    g_hookMoveTargetTo = HyprlandAPI::createFunctionHook(PHANDLE, moveAddr.p, reinterpret_cast<void*>(&hkMoveTargetTo));
+    if (g_hookMoveTargetTo && g_hookMoveTargetTo->hook()) {
+        g_origMoveTargetTo = reinterpret_cast<moveTargetTo_t>(g_hookMoveTargetTo->m_original);
+        Log::logger->log(Hyprutils::CLI::LOG_DEBUG, "[hyprsnug] expelTarget and moveTargetTo hooked");
+    } else
+        Log::logger->log(Hyprutils::CLI::LOG_ERR, "[hyprsnug] moveTargetTo hook failed: moved stacked windows keep the layout default width");
 
     g_listenerWindowFloating = listenSafe(Event::bus()->m_events.window.floating, "window.floating", [](const PHLWINDOW& w) {
     // Dragging a *pseudo* window around (Super+LMB): the drag controller floats
@@ -518,10 +627,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     });
 
-    return {"hyprsnug", "Inherits scrolling column widths from window widths on embed, drag, open into the strip and workspace move", "svtrn", HYPRSNUG_VERSION};
+    return {"hyprsnug", "Inherits scrolling column widths from window widths on embed, drag, promote, move and workspace move", "svtrn", HYPRSNUG_VERSION};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Unhook before anything else: no hooked code may run once plugin state
+    // starts going away.
+    if (g_hookExpelTarget) {
+        HyprlandAPI::removeFunctionHook(PHANDLE, g_hookExpelTarget);
+        g_hookExpelTarget = nullptr;
+    }
+    if (g_hookMoveTargetTo) {
+        HyprlandAPI::removeFunctionHook(PHANDLE, g_hookMoveTargetTo);
+        g_hookMoveTargetTo = nullptr;
+    }
+
     g_listenerWindowFloating.reset();
     g_listenerDragEnd.reset();
     g_listenerMoveToWorkspace.reset();

@@ -11,6 +11,12 @@ version lives in [`VERSION`](./VERSION).
 
 ### Added
 
+- Columns that the layout's own reorganization creates are fitted as well
+  (BR-24): `promote`, `expel`, `consume_or_expel` and a directional move of a
+  stacked window give the fresh column the window's own size instead of the
+  default column width. Implemented with function hooks on
+  `CScrollingAlgorithm::expelTarget` and `CScrollingAlgorithm::moveTargetTo`,
+  reusing the same fit as embed / drag / open.
 - Event handlers run behind an exception barrier: an error thrown inside a
   handler is logged and the event is skipped, instead of escaping into the
   compositor's event dispatch and aborting the session.
