@@ -34,7 +34,13 @@ clean:
 # Smoke testing after a change: see "Smoke testing after a change" in AGENTS.md.
 # The order is mandatory — unload, build, load. Rebuilding a loaded .so means
 # overwriting a memory-mapped file, which crashes the running compositor.
+# The hyprpm-managed copy is disabled first: two copies of the plugin loaded at
+# once share the "plugin:hyprsnug:*" config keys, and unloading one of them
+# afterwards invalidates the other's config values — the next dereference
+# aborts the compositor. disable (not remove): the managed install stays
+# intact and is restored by dev-done.
 dev-reload:
+	@$(HYPRPM) disable hyprsnug >/dev/null 2>&1 || true
 	@$(HYPRCTL) plugin unload "$(PLUGIN_SO)" >/dev/null 2>&1 || true
 	$(MAKE) all
 	@$(HYPRCTL) plugin load "$(PLUGIN_SO)"

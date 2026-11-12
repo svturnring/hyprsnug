@@ -77,6 +77,7 @@ install — never both.
 | `plugin:hyprsnug:mode`            | string | `exact` | how the column wraps the window (see below) |
 | `plugin:hyprsnug:sync_pseudosize` | int    | `1`     | keep the compact size equal to the floating size |
 | `plugin:hyprsnug:fix_drag_ghost`  | int    | `1`     | keep a dragged compact window at its own size |
+| `plugin:hyprsnug:disable_drop_into_column` | bool | `true` | a dropped window lands in its own column instead of merging |
 
 `mode`:
 
@@ -90,6 +91,11 @@ window is embedded or dragged, so it never changes size on the way in or out.
 `fix_drag_ghost` keeps a dragged compact window at its compact size instead of
 letting it briefly grow to the whole column.
 
+`disable_drop_into_column` turns off the layout's native "drop into the column"
+merge: dropping a window onto another window gives the dropped window a column of
+its own, on the side of the drop, and the windows already in the strip keep their
+sizes. Set it to `false` to restore the native merging.
+
 Set either fix to `0` to turn it off.
 
 Example (Lua config):
@@ -98,10 +104,11 @@ Example (Lua config):
 hl.config({
     plugin = {
         hyprsnug = {
-            enabled         = true,
-            mode            = "exact",
-            sync_pseudosize = true,
-            fix_drag_ghost  = true,
+            enabled                  = true,
+            mode                     = "exact",
+            sync_pseudosize          = true,
+            fix_drag_ghost           = true,
+            disable_drop_into_column = true,
         },
     },
 })

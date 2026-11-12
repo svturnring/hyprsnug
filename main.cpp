@@ -32,6 +32,8 @@
 #include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/layout/space/Space.hpp>
 #include <hyprland/src/layout/algorithm/Algorithm.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
@@ -81,12 +83,46 @@ struct SPluginConfig {
     CConfigValue<Config::STRING>  mode{"plugin:hyprsnug:mode"};
     CConfigValue<Config::INTEGER> syncPseudoSize{"plugin:hyprsnug:sync_pseudosize"};
     CConfigValue<Config::INTEGER> fixDragGhost{"plugin:hyprsnug:fix_drag_ghost"};
+    CConfigValue<Config::BOOL>    disableDropIntoColumn{"plugin:hyprsnug:disable_drop_into_column"};
 };
 
 // Constructed on its first call, which is deliberately PLUGIN_INIT.
 SPluginConfig& pluginConfig() {
     static SPluginConfig CFG;
     return CFG;
+}
+
+/*
+    Exception barrier around event handlers.
+
+    An exception escaping a handler propagates out of the compositor's event
+    dispatch and ends in std::terminate, aborting Hyprland and taking the whole
+    session down with it. Nothing a handler does is worth a session crash:
+    listeners are registered through listenSafe(), which catches whatever the
+    handler throws, logs it, and lets the event pass as if the handler did
+    nothing.
+*/
+void safeRun(const char* what, auto&& fn) {
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        Log::logger->log(Hyprutils::CLI::LOG_ERR, std::format("[hyprsnug] {} failed: {}", what, e.what()));
+    } catch (...) {
+        Log::logger->log(Hyprutils::CLI::LOG_ERR, std::format("[hyprsnug] {} failed: unknown exception", what));
+    }
+}
+
+/*
+    Deduced from the signal type itself, so the wrapping lambda has the exact
+    parameter list of the signal. A generic (auto&&...) lambda would be
+    ambiguous between CSignalT::listen()'s std::function<void(Args...)> and
+    std::function<void()> overloads.
+*/
+template <typename... Args, typename F>
+auto listenSafe(Hyprutils::Signal::CSignalT<Args...>& signal, const char* what, F&& fn) {
+    return signal.listen([what, fn = std::forward<F>(fn)](const Args&... args) {
+        safeRun(what, [&] { fn(args...); });
+    });
 }
 
 /*
@@ -103,6 +139,80 @@ struct SPendingMoveFit {
     float     widthPx;
 };
 std::vector<SPendingMoveFit> g_pendingMoveFits;
+
+/*
+    Dropping a tiled window onto another window merges both into one column
+    (the "drop into the column" branch of CScrollingAlgorithm::newTarget): the
+    dropped window gets a 1/(n+1) share of the column's height and every window
+    already inside it shrinks. That contradicts BR-22 -- sizes may only change on
+    an explicit user request.
+
+    With disable_drop_into_column the merge is undone immediately: the dropped
+    window is moved out into a fresh column next to the one it was dropped on,
+    through the same primitive the layout's own `promote` / `expel` messages use
+    (CScrollingAlgorithm::expelTarget). This runs from the drag-end event, which
+    the drag controller emits at the very end of the drop handling and before the
+    compositor renders, so the merged state is never visible.
+
+    The fresh column goes on the side of the drop -- pointer position against the
+    middle of the merged column along the tape axis, the same rule the old
+    hyprscrolling plugin used.
+*/
+void splitDroppedWindowFromColumn(const PHLWINDOW& w) {
+    if (!*pluginConfig().enabled || !*pluginConfig().disableDropIntoColumn)
+        return;
+
+    if (!w || w->isFloating())
+        return;
+
+    const auto TARGET = w->layoutTarget();
+    if (!TARGET)
+        return;
+
+    if (!w->m_workspace || !w->m_workspace->space())
+        return;
+
+    const auto ALGO = w->m_workspace->space()->algorithm();
+    if (!ALGO)
+        return;
+
+    auto* const SCROLLING = dynamic_cast<Layout::Tiled::CScrollingAlgorithm*>(ALGO->tiledAlgo().get());
+    if (!SCROLLING)
+        return; // not the scrolling layout, nothing to split
+
+    const auto TDATA = SCROLLING->dataFor(TARGET);
+    if (!TDATA)
+        return;
+
+    const auto COL = TDATA->column.lock();
+    if (!COL || COL->targetDatas.size() < 2)
+        return; // the drop created its own column, there is no merge to undo
+
+    const auto SD = SCROLLING->m_scrollingData;
+    if (!SD)
+        return;
+
+    const auto IDX = SD->idx(COL);
+    if (IDX < 0)
+        return;
+
+    // Side of the drop along the tape axis: middle of the merged column's box.
+    const bool   HORIZ = SD->controller && SD->controller->isPrimaryHorizontal();
+    const auto   FIRST = COL->targetDatas.front()->layoutBox;
+    double       lo    = HORIZ ? FIRST.x : FIRST.y;
+    double       hi    = HORIZ ? FIRST.x + FIRST.w : FIRST.y + FIRST.h;
+    for (size_t i = 1; i < COL->targetDatas.size(); ++i) {
+        const auto BOX = COL->targetDatas[i]->layoutBox;
+        lo             = std::min(lo, HORIZ ? BOX.x : BOX.y);
+        hi             = std::max(hi, HORIZ ? BOX.x + BOX.w : BOX.y + BOX.h);
+    }
+
+    const auto MOUSE = g_pInputManager->getMouseCoordsInternal();
+    const bool AFTER = (HORIZ ? MOUSE.x : MOUSE.y) >= (lo + hi) / 2.;
+
+    SCROLLING->expelTarget(TDATA, COL, AFTER ? IDX : IDX - 1);
+    SD->recalculate();
+}
 
 /*
     If the window is tiled in the built-in scrolling layout and is the *sole*
@@ -281,12 +391,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                               "plugin:hyprsnug:fix_drag_ghost",
                                               "While dragging a pseudo window (Super+LMB) keep the ghost at the pseudo size instead of the full column size",
                                               1));
+    HyprlandAPI::addConfigValueV2(PHANDLE, makeShared<Config::Values::CBoolValue>(
+                                              "plugin:hyprsnug:disable_drop_into_column",
+                                              "A window dropped onto another window lands in a column of its own on the side of the drop instead of merging into that window's column",
+                                              true));
 
     // Force-construct the config value accessors now, while every value above
     // is definitely registered, so no event handler ever has to bind them.
     (void)pluginConfig();
 
-    g_listenerWindowFloating = Event::bus()->m_events.window.floating.listen([](const PHLWINDOW& w) {
+    g_listenerWindowFloating = listenSafe(Event::bus()->m_events.window.floating, "window.floating", [](const PHLWINDOW& w) {
     // Dragging a *pseudo* window around (Super+LMB): the drag controller floats
     // the window and builds the drag "ghost" box from the *full column*
     // geometry, so the window visually jumps to the whole column height for the
@@ -332,9 +446,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // Moving windows (Super+LMB drag). Fires after the drag controller has
     // restored the window's original floating size.
-    g_listenerDragEnd = g_layoutManager->dragController()->m_events.ended.listen([] {
+    g_listenerDragEnd = listenSafe(g_layoutManager->dragController()->m_events.ended, "drag end", [] {
         if (const auto W = g_dragWindow.lock()) {
             g_dragWindow.reset();
+            splitDroppedWindowFromColumn(W);
             fitColumnToWindow(W);
         }
     });
@@ -342,7 +457,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // Moving a window between workspaces. Fires *before* the window is re-tiled.
     // Re-fit the fresh destination column to the window's pre-move size on the
     // next compositor tick, once the new column exists.
-    g_listenerMoveToWorkspace = Event::bus()->m_events.window.moveToWorkspace.listen([](const PHLWINDOW& w, const PHLWORKSPACE& /*workspace*/) {
+    g_listenerMoveToWorkspace = listenSafe(Event::bus()->m_events.window.moveToWorkspace, "moveToWorkspace", [](const PHLWINDOW& w, const PHLWORKSPACE& /*workspace*/) {
         if (!w || w->isFloating())
             return;
 
@@ -357,7 +472,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_pendingMoveFits.push_back({w, WIDTH});
     });
 
-    g_listenerTick = Event::bus()->m_events.tick.listen([] {
+    g_listenerTick = listenSafe(Event::bus()->m_events.tick, "tick", [] {
         if (g_pendingMoveFits.empty())
             return;
 
@@ -386,7 +501,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // was copied from the default column geometry and is useless, so the
     // natural requested size Hyprland remembered at open (lastFloatingSize) is
     // used instead.
-    g_listenerWindowOpen = Event::bus()->m_events.window.open.listen([](const PHLWINDOW& w) {
+    g_listenerWindowOpen = listenSafe(Event::bus()->m_events.window.open, "window.open", [](const PHLWINDOW& w) {
         if (!w || w->isFloating())
             return;
 
